@@ -2,14 +2,17 @@ import tensorflow as tf
 import numpy as np
 import time
 import datetime
-import model
+import model_2
 import get_data
 import config
 from sklearn.metrics import average_precision_score, roc_auc_score
 from absl import flags, app
 import os, sys
 import timeit
+import pandas as pd
+from scipy import stats
 FLAGS = flags.FLAGS
+
 
 def MakeSummary(name, value):
     """Creates a tf.Summary proto with the given name and value."""
@@ -174,11 +177,30 @@ def Community_Prec(pred, Y): #the smaller the better
     np.mean(np.std(NES, axis = 1))
 
 
-def train_step(hg, input_X, input_Y, optimizer, step, writer):
+def train_step(hg, DL, optimizer, step, writer):
     """Performs a training step, computes gradients, and logs metrics."""
+    
+    valid_log = get_data.Log()
 
+    train_idx, valid_idx, n_features, n_classes = DL.get_indices()
+    batch_size = FLAGS.batch_size
+    np.random.shuffle(train_idx)
+   
+    for i in range((len(train_idx)-1)//batch_size + 1):
+
+        start = batch_size*i
+        end = min(batch_size*(i+1), len(train_idx))
+
+        input_X = DL.get_X(train_idx[start:end])
+        input_Y = DL.get_Y(train_idx[start:end])
+
+        feed_dict={}
+        feed_dict[hg.input_X]=input_X
+        feed_dict[hg.input_Y]=input_Y
+        #feed_dict[hg.keep_prob]=1.0
+    
     with tf.GradientTape() as tape:
-        indiv_prob,  marginal_loss, l2_loss, total_loss = hg(is_training=True, n_features = n_features, n_classes = n_classes )
+        indiv_prob,  nll_loss, marginal_loss, l2_loss, total_loss = hg((input_X, input_Y), is_training=True)
 
     # Compute gradients
     gradients = tape.gradient(total_loss, hg.trainable_variables)
@@ -191,26 +213,31 @@ def train_step(hg, input_X, input_Y, optimizer, step, writer):
 
     # Log metrics
     with writer.as_default():
+        tf.summary.scalar("train/nll_loss", nll_loss, step=step)
         tf.summary.scalar("train/marginal_loss", marginal_loss, step=step)
         tf.summary.scalar("train/l2_loss", l2_loss, step=step)
         tf.summary.scalar("train/total_loss", total_loss, step=step)
 
-    return indiv_prob, marginal_loss, l2_loss, total_loss
+    return indiv_prob, nll_loss, marginal_loss, l2_loss, total_loss
 
 
-def validation_step(hg, DL, summary_writer, valid_idx, writer, epoch, metrics, metric_names):
+def validation_step(hg, DL, valid_idx, writer, step, metrics, metric_names):
 
     print('Validating...')
+    all_nll_loss, all_marginal_loss, all_l2_loss, all_total_loss = 0, 0, 0, 0
+    all_preds, all_Ys = [], []
 
+    for i in range(0, len(valid_idx)-(len(valid_idx) % FLAGS.batch_size), FLAGS.batch_size):
+        batch_indices = valid_idx[i:i + FLAGS.batch_size]
     valid_log = get_data.Log()
 
-
+    train_idx, valid_idx, n_features, n_classes = DL.get_indices()
+    
     batch_size = FLAGS.batch_size
 
-    Ys = []
-    preds = []
+    
     for i in range((len(valid_idx)-1)//batch_size + 1):
-
+        batch_indices = valid_idx[i:i + FLAGS.batch_size]
         start = batch_size*i
         end = min(batch_size*(i+1), len(valid_idx))
 
@@ -220,21 +247,24 @@ def validation_step(hg, DL, summary_writer, valid_idx, writer, epoch, metrics, m
         feed_dict={}
         feed_dict[hg.input_X]=input_X
         feed_dict[hg.input_Y]=input_Y
-        feed_dict[hg.keep_prob]=1.0
-
+        
+        #feed_dict[hg.keep_prob]=1.0
         # Forward pass (no gradient calculation during validation)
-        preds, nll_loss, marginal_loss, l2_loss, total_loss = hg(is_training=False, n_features=n_features, n_classes=n_classes)
+        preds, nll_loss, marginal_loss, l2_loss, total_loss = hg((input_X, input_Y),is_training=False)
+        preds = np.array(preds)
+        
         # Aggregate results
-        all_nll_loss += nll_loss * len(batch_size)
-        all_l2_loss += l2_loss * len(batch_size)
-        all_total_loss += total_loss * len(batch_size)
-        all_marginal_loss += marginal_loss * len(batch_size)   
-        for ii in preds:
-            print(ii.shape)
-            preds.append(ii)
-        for ii in input_Y:
-            Ys.append(ii)
-   
+        all_nll_loss += nll_loss * len(batch_indices)
+        all_l2_loss += l2_loss * len(batch_indices)
+        all_total_loss += total_loss * len(batch_indices)
+        all_marginal_loss += marginal_loss * len(batch_indices)   
+        
+        #all_preds = np.concatenate((all_preds, preds), axis=0)
+        #all_Ys = np.concatenate((all_Ys, preds), axis=0)
+        
+        #all_preds = np.array(all_preds)
+        
+        #all_Ys = np.array(all_Ys) 
         # Compute average metrics
         mean_nll_loss = all_nll_loss / len(valid_idx)
         mean_l2_loss = all_l2_loss / len(valid_idx)
@@ -243,22 +273,26 @@ def validation_step(hg, DL, summary_writer, valid_idx, writer, epoch, metrics, m
 
         # Compute average precision and AUC
 
-        Ys = np.concatenate(Ys).flatten()
-        preds = np.concatenate(preds).flatten()
-        print(Ys)
-        print(preds)
-        ap = average_precision_score(Ys, preds)
-    
+        all_Ys = np.concatenate(input_Y).flatten()
+        all_preds = np.concatenate(preds).flatten()
+        print(all_preds)
+       
+        ap = average_precision_score(all_Ys, all_preds)
+        try:
+            auc = roc_auc_score(all_Ys, all_preds)
+        except ValueError:
+            auc = 0.0
 
     # Log results to TensorBoard
     with writer.as_default():
+        tf.summary.scalar("validation/ap", ap, step = step)
+        tf.summary.scalar("validation/auc", auc, step = step)
+        tf.summary.scalar("validation/nll_loss", mean_nll_loss, step = step)
+        tf.summary.scalar("validation/marginal_loss", mean_marginal_loss, step = step)
+        tf.summary.scalar("validation/l2_loss", mean_l2_loss, step = step)
+        tf.summary.scalar("validation/total_loss", mean_total_loss, step = step)
 
-        tf.summary.scalar("validation/nll_loss", mean_nll_loss, step=step)
-        tf.summary.scalar("validation/marginal_loss", mean_marginal_loss, step=step)
-        tf.summary.scalar("validation/l2_loss", mean_l2_loss, step=step)
-        tf.summary.scalar("validation/total_loss", mean_total_loss, step=step)
-
-    return mean_nll_loss, preds, Ys
+    return mean_nll_loss, [preds, input_Y]
 
     
 
@@ -307,15 +341,15 @@ def main(_):
     print('building network...')
 
     #building the model 
-    hg = model.MODEL(is_training=True, n_features = n_features, n_classes = n_classes)
+    hg = model_2.MODEL(is_training = True,n_features =n_features, n_classes = n_classes)
 
     global_step = tf.Variable(0, name='global_step', trainable=False)
 
   # Learning rate schedule
     learning_rate_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
         initial_learning_rate=0.01,
-        decay_steps=10000,
-        decay_rate=0.96,
+        decay_steps=(1.0/FLAGS.lr_decay_times)*(FLAGS.max_epoch*one_epoch_iter),
+        decay_rate=FLAGS.lr_decay_ratio,
         staircase=True
     )
 
@@ -335,18 +369,19 @@ def main(_):
     # TensorBoard summary writer
     summary_writer = tf.summary.create_file_writer(FLAGS.summary_dir)
 
-    best_loss = float('inf')
+   
     current_step = global_step.numpy()  # Convert to integer
     best_loss = float('inf')
     best_epoch = 0
     drop_cnt = 0
     max_epoch = FLAGS.max_epoch
+    step = 0
     for epoch in range(max_epoch):
         print(f'Epoch {epoch+1} starts!')
         
         # Shuffle training indices
         np.random.shuffle(train_idx)
-        
+        smooth_nll_loss = 0.0
         smooth_marginal_loss = 0.0
         smooth_l2_loss = 0.0
         smooth_total_loss = 0.0
@@ -366,9 +401,10 @@ def main(_):
             
             
             # Perform training step
-            indiv_prob, nll_loss, marginal_loss, l2_loss, total_loss = train_step(hg, input_X, input_Y, n_features, n_classes, optimizer, current_step, summary_writer)
+            indiv_prob, nll_loss, marginal_loss, l2_loss, total_loss = train_step(hg, DL, optimizer, current_step, summary_writer)
 
             # Update smooth losses
+            smooth_nll_loss += nll_loss
             smooth_marginal_loss += marginal_loss
             smooth_l2_loss += l2_loss
             smooth_total_loss += total_loss
@@ -380,7 +416,7 @@ def main(_):
             
             # Log progress every `check_freq` iterations
             if (i + 1) % FLAGS.check_freq == 0:
-                mean_nll_loss = smooth_marginal_loss/FLAGS.check_freq
+                mean_nll_loss = smooth_nll_loss/FLAGS.check_freq
                 mean_marginal_loss = smooth_marginal_loss/FLAGS.check_freq
                 mean_l2_loss = smooth_l2_loss / FLAGS.check_freq
                 mean_total_loss = smooth_total_loss / FLAGS.check_freq
@@ -399,7 +435,7 @@ def main(_):
                     print('Warning: AUC computation failed due to label mismatch.')
                     auc = None 
 
-                
+              
                 # Write to TensorBoard
                 with summary_writer.as_default():
                     tf.summary.scalar('train/ap', ap, step=current_step)
@@ -411,7 +447,7 @@ def main(_):
                 
                 time_str = datetime.datetime.now().isoformat()
 
-                print ("train step: %s\tap=%.6f\tnll_loss=%.6f\tmarginal_loss=%.6f\tl2_loss=%.6f\ttotal_loss=%.6f" % (time_str, ap, nll_loss, marginal_loss, l2_loss, total_loss))
+                print ("train step: %s\tap=%.6f\tauc=%.6f\tnll_loss=%.6f\tmarginal_loss=%.6f\tl2_loss=%.6f\ttotal_loss=%.6f" % (time_str, ap, auc, nll_loss, marginal_loss, l2_loss, total_loss))
             
                 # Reset accumulators
                 temp_indiv_prob = []
@@ -424,6 +460,8 @@ def main(_):
         if (epoch + 1) % save_epoch == 0:
             # Evaluate on test set
             Res = []
+            test_loss, (preds, Ys) = validation_step(hg, DL, test_idx, summary_writer, epoch, metrics, metric_names)
+            
             for i in range(len(metrics)):
                 f = metrics[i]
                 name = metric_names[i]
@@ -435,7 +473,6 @@ def main(_):
                 else:
                     Res.append(res[1])
             
-            test_loss, preds, Ys = validation_step(hg, DL, n_features, n_classes, summary_writer, test_idx, summary_writer, epoch, metrics, metric_names)
             
             
             print(f"Epoch {epoch+1} validation loss: {test_loss}")
@@ -462,7 +499,7 @@ def main(_):
     print('the best checkpoint is '+str(best_epoch))
     ed_time = timeit.default_timer()
     print("Running time:", ed_time - st_time)
-    preds, Ys = best_res
+    (preds, Ys) = best_res
     Res = []
     for i in range(len(metrics)):
         f = metrics[i]
@@ -477,8 +514,6 @@ def main(_):
 
     np.save("results/%s_%s"%(sys.argv[1], sys.argv[2]), Res)
     
-
-
 
 
 
